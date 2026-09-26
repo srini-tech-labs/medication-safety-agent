@@ -1,0 +1,746 @@
+{% extends "base.html" %}
+{% block title %}Medication Safety Agent{% endblock %}
+{% block body %}
+<main class="panel wide" x-data="appShell()" x-cloak>
+  <h1>Medication Safety Agent</h1>
+  <p class="subtitle">Synthetic/fictional patient data only. Not for clinical use.</p>
+  {% if demo_mode %}
+  <p class="demo-mode-banner">DEMO MODE — offline canned responses, not connected to Databricks. Findings for P001/P002/P003 are real captured facts replayed locally; the AI explanation, other patient IDs, and drugs outside Lisinopril/Spironolactone/Ibuprofen are not live.</p>
+  {% endif %}
+
+  <div class="patient-bar">
+    <div class="field">
+      <label for="patient-select">Patient</label>
+      <select id="patient-select" x-model="selectedSeed" @change="loadSeed()">
+        <option value="">Custom</option>
+        {% for pid in seed_patients %}
+        <option value="{{ pid }}">{{ pid }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label for="patient-id">Patient ID</label>
+      <input id="patient-id" type="text" x-model.lazy="patient_id" placeholder="Enter a patient ID">
+    </div>
+    <div class="field">
+      <label for="egfr">eGFR</label>
+      <input id="egfr" type="number" x-model.number="labs.egfr">
+    </div>
+    <div class="field">
+      <label for="potassium">Potassium</label>
+      <input id="potassium" type="number" step="0.1" x-model.number="labs.potassium">
+    </div>
+  </div>
+
+  <div class="tab-bar">
+    <button type="button" class="tab-btn" :class="{ active: activeTab === 'safety' }" @click="activeTab = 'safety'">Medication Safety Analysis</button>
+    <button type="button" class="tab-btn" :class="{ active: activeTab === 'medications' }" @click="activeTab = 'medications'">Medication Management</button>
+  </div>
+
+  <section x-show="activeTab === 'safety'" x-data="safetyCheckTab()" x-init="init()">
+    <form @submit.prevent="submit()">
+      <div class="field">
+        <label for="age">Age</label>
+        <input id="age" type="number" x-model.number="age" required>
+      </div>
+      <div class="field">
+        <label for="medications">Medications (comma-separated)</label>
+        <input id="medications" type="text" x-model="medicationsText" placeholder="Lisinopril, Ibuprofen">
+      </div>
+      <div class="field">
+        <label for="conditions">Conditions (comma-separated, optional)</label>
+        <input id="conditions" type="text" x-model="conditionsText" placeholder="CKD">
+      </div>
+      <div class="field">
+        <label for="allergies">Allergies (comma-separated, optional)</label>
+        <input id="allergies" type="text" x-model="allergiesText" placeholder="Penicillin">
+      </div>
+      <button class="btn btn-primary" type="submit" :disabled="loading || !patient_id">
+        <span x-show="!loading">Analyze</span>
+        <span x-show="loading">Analyzing…</span>
+      </button>
+    </form>
+
+    <div class="error" x-show="error" x-text="error"></div>
+
+    <section class="report" x-show="report" x-cloak>
+      <h2>
+        Overall risk:
+        <span class="badge" :class="'badge-' + (report?.overall_risk || '').toLowerCase()" x-text="report?.overall_risk"></span>
+      </h2>
+
+      <h3>Normalized medications</h3>
+      <ul class="med-list">
+        <template x-for="m in (report?.normalized_medications || [])" :key="m.rxcui">
+          <li x-text="m.normalized_name || m.input_name"></li>
+        </template>
+      </ul>
+
+      <h3>Drug-drug findings</h3>
+      <template x-for="(f, i) in (report?.drug_drug_findings || [])" :key="i">
+        <article class="finding-card">
+          <div class="finding-header">
+            <span x-text="f.drug_a + ' + ' + f.drug_b"></span>
+            <span class="badge" :class="'badge-' + (f.severity || '').toLowerCase()" x-text="f.severity"></span>
+          </div>
+          <p x-text="f.interaction"></p>
+          <details class="finding-evidence">
+            <summary>Evidence &amp; details</summary>
+            <dl>
+              <dt>RxCUI</dt><dd x-text="f.drug_a_rxcui + ' / ' + f.drug_b_rxcui"></dd>
+              <dt>Source</dt><dd x-text="f.evidence?.source"></dd>
+              <dt>Section</dt><dd x-text="f.evidence?.section_title + (f.evidence?.subsection_title ? ' / ' + f.evidence?.subsection_title : '')"></dd>
+              <dt>Evidence ID</dt><dd x-text="f.evidence?.evidence_id"></dd>
+              <dt>Review status</dt><dd x-text="f.review_status"></dd>
+            </dl>
+          </details>
+        </article>
+      </template>
+      <p class="empty-note" x-show="!(report?.drug_drug_findings || []).length">None</p>
+
+      <h3>Drug-lab findings</h3>
+      <template x-for="(f, i) in (report?.drug_lab_findings || [])" :key="i">
+        <article class="finding-card">
+          <div class="finding-header">
+            <span x-text="f.drug + ' — ' + labLabel(f.lab)"></span>
+            <span class="badge" :class="'badge-' + (f.severity || '').toLowerCase()" x-text="f.severity"></span>
+          </div>
+          <p x-text="f.message"></p>
+          <p class="threshold-basis" x-show="f.threshold_basis" x-text="f.threshold_basis"></p>
+          <details class="finding-evidence">
+            <summary>Evidence &amp; details</summary>
+            <dl>
+              <dt>Rule</dt><dd x-text="labLabel(f.lab) + ' ' + f.operator + ' ' + f.threshold + ' (patient value: ' + f.value + ')'"></dd>
+              <dt>RxCUI</dt><dd x-text="f.drug_rxcui"></dd>
+              <dt>Source</dt><dd x-text="f.evidence?.source"></dd>
+              <dt>Section</dt><dd x-text="f.evidence?.section_title + (f.evidence?.subsection_title ? ' / ' + f.evidence?.subsection_title : '')"></dd>
+              <dt>Evidence ID</dt><dd x-text="f.evidence?.evidence_id"></dd>
+            </dl>
+          </details>
+        </article>
+      </template>
+      <p class="empty-note" x-show="!(report?.drug_lab_findings || []).length">None</p>
+
+      <h3>Explanation</h3>
+      <p class="explanation-meta" x-show="explanationLabel()" x-text="explanationLabel()"></p>
+      <p x-text="cleanExplanation()"></p>
+      <p class="disclaimer" x-show="report?.ai_explanation">AI-generated explanation for synthetic demonstration data only. The underlying medication-safety findings are derived from the application's configured rules and evidence. The explanation is not intended for patient care or as a treatment recommendation.</p>
+    </section>
+  </section>
+
+  <section x-show="activeTab === 'medications'" x-data="medicationManagementTab()" x-init="init()" x-cloak>
+    <p class="disclaimer">Prototype using synthetic data. Safety screening is limited to supported rules and available patient data and does not replace review by a clinician or pharmacist.</p>
+
+    <div class="error" x-show="!endpointAvailable" x-cloak>
+      Medication lookup is temporarily unavailable. Existing patient information remains visible, but medication search and updates are currently disabled.
+      <button type="button" class="btn" @click="checkHealth()" :disabled="healthChecking">Retry</button>
+    </div>
+
+    <div class="med-grid">
+      <div class="med-list-column">
+        <div class="med-list-header">
+          <h2>Current Medication List</h2>
+          <button type="button" class="btn" @click="loadMedications()" :disabled="medicationsLoading">Refresh</button>
+        </div>
+        <p class="subtitle" x-show="!medicationsLoading" x-text="medications.length + ' active medication' + (medications.length === 1 ? '' : 's')"></p>
+
+        <div class="error" x-show="medicationsError" x-text="medicationsError"></div>
+
+        <template x-if="!medicationsLoading && !medications.length && !medicationsError">
+          <p class="empty-note">
+            No active medications are recorded for this patient.<br><br>
+            Use Search and Add Medication to create the medication list.
+          </p>
+        </template>
+
+        <template x-for="m in medications" :key="m.medication_record_id">
+          <article class="finding-card med-card">
+            <div class="finding-header">
+              <span x-text="m.selected_name"></span>
+              <span class="badge" :class="'badge-' + (m.medication_type || '').toLowerCase()" x-text="m.medication_type"></span>
+            </div>
+            <p class="med-meta">
+              <span x-show="m.strength" x-text="m.strength"></span>
+              <span x-show="m.route" x-text="m.route"></span>
+              <span x-show="m.dose_form" x-text="m.dose_form"></span>
+            </p>
+            <p class="med-meta" x-show="m.primary_ingredient_name">Ingredient: <span x-text="m.primary_ingredient_name"></span></p>
+            <p class="med-meta">
+              <span class="badge" :class="'badge-' + (m.medication_status || '').toLowerCase()" x-text="m.medication_status"></span>
+              <span x-show="m.added_at" x-text="'Added ' + (m.added_at || '').slice(0, 10)"></span>
+            </p>
+            <details class="finding-evidence">
+              <summary>Details</summary>
+              <dl>
+                <dt>RxCUI</dt><dd x-text="m.selected_rxcui"></dd>
+                <dt>Source</dt><dd x-text="m.source"></dd>
+              </dl>
+            </details>
+
+            <template x-if="confirmingRecordId !== m.medication_record_id">
+              <button type="button" class="btn" :disabled="!endpointAvailable" @click="confirmingRecordId = m.medication_record_id">Discontinue</button>
+            </template>
+            <div class="confirm-inline" x-show="confirmingRecordId === m.medication_record_id" x-cloak>
+              <p>Discontinue <strong x-text="m.selected_name"></strong>? It will leave the active list but remain in history.</p>
+              <button type="button" class="btn" @click="confirmingRecordId = null" :disabled="discontinuing">Cancel</button>
+              <button type="button" class="btn btn-primary" @click="discontinue(m.medication_record_id)" :disabled="discontinuing">Confirm discontinuation</button>
+            </div>
+          </article>
+        </template>
+      </div>
+
+      <div class="med-add-column">
+        <h2>Search and Add Medication</h2>
+
+        <div x-show="flowStep === 'search'">
+          <h3>1. Search medication</h3>
+          <div class="field">
+            <label for="med-search">Medication name</label>
+            <input id="med-search" type="text" x-model="searchQuery" @input="onSearchInput()"
+                   placeholder="Enter at least 3 characters, for example &quot;lisi&quot;" :disabled="!endpointAvailable">
+          </div>
+          <p class="empty-note" x-show="searchQuery.trim().length > 0 && searchQuery.trim().length < 3">Enter at least 3 characters.</p>
+          <p class="empty-note" x-show="searchLoading">Searching…</p>
+          <div class="error" x-show="searchError" x-text="searchError"></div>
+          <p class="empty-note" x-show="!searchLoading && searchQuery.trim().length >= 3 && !searchResults.length && !searchError">
+            No matching RxNorm medications were found. Check the spelling or try a more general medication name.
+          </p>
+          <ul class="search-result-list" x-show="searchResults.length">
+            <template x-for="r in searchResults" :key="r.rxcui">
+              <li class="search-result-item" tabindex="0" @click="selectMatch(r)" @keydown.enter="selectMatch(r)">
+                <span x-text="r.name"></span>
+                <span class="rxcui" x-text="'RxCUI ' + r.rxcui"></span>
+              </li>
+            </template>
+          </ul>
+        </div>
+
+        <div x-show="flowStep === 'review'" x-cloak>
+          <h3>2. Review medication</h3>
+          <button type="button" class="btn" @click="flowStep = 'search'">&larr; Back to search</button>
+          <p class="empty-note" x-show="detailsLoading">Loading details…</p>
+          <div class="error" x-show="detailsError" x-text="detailsError"></div>
+
+          <article class="finding-card">
+            <div class="finding-header"><span x-text="displayName"></span></div>
+            <p class="med-meta" x-show="details?.full_generic_name">Generic: <span x-text="details?.full_generic_name"></span></p>
+            <p class="med-meta" x-show="details?.strength" x-text="details?.strength"></p>
+            <p class="med-meta" x-show="details?.route" x-text="details?.route"></p>
+            <p class="med-meta" x-show="details?.rxterms_dose_form || details?.rxnorm_dose_form" x-text="details?.rxterms_dose_form || details?.rxnorm_dose_form"></p>
+            <p class="med-meta" x-show="details?.ingredients?.length">
+              Ingredients: <span x-text="(details?.ingredients || []).map(i => i.name).join(', ')"></span>
+            </p>
+            <p class="rxcui" x-text="'RxCUI ' + (selectedMatch?.rxcui || '')"></p>
+            <p class="med-meta">Source: NLM RxNorm + RxTerms</p>
+          </article>
+
+          <div class="field">
+            <label for="med-status">How should this medication be recorded?</label>
+            <select id="med-status" x-model="status">
+              <option value="PROPOSED">Proposed — the patient is considering it or it was newly prescribed</option>
+              <option value="CURRENT">Current — the patient is already taking it</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="med-type">Medication type</label>
+            <select id="med-type" x-model="classification">
+              <option value="UNKNOWN">Unknown</option>
+              <option value="RX">Prescription (RX)</option>
+              <option value="OTC">Over-the-counter (OTC)</option>
+            </select>
+          </div>
+
+          <button type="button" class="btn btn-primary" @click="runSafetyCheck()"
+                  :disabled="!patient_id || !selectedMatch?.rxcui || safetyLoading || !endpointAvailable">
+            <span x-show="!safetyLoading">Check safety before adding</span>
+            <span x-show="safetyLoading">Checking…</span>
+          </button>
+        </div>
+
+        <div x-show="flowStep === 'safety'" x-cloak>
+          <h3>3. Safety review</h3>
+          <button type="button" class="btn" @click="flowStep = 'review'" :disabled="adding">&larr; Back to review</button>
+          <div class="error" x-show="safetyError" x-text="safetyError"></div>
+
+          <template x-if="safety">
+            <div class="safety-panel" :class="'safety-panel-' + worstSeverity">
+              <p class="safety-panel-label" x-text="'[' + (worstSeverity || 'none').toUpperCase() + ']'"></p>
+              <p x-text="safety.message"></p>
+              <p class="error" x-show="safetyLabsMissing">Medication-lab screening may be incomplete because current lab information was unavailable.</p>
+
+              <template x-if="safety.drug_drug_findings?.length">
+                <div>
+                  <h4>Medication interactions</h4>
+                  <template x-for="(f, i) in safety.drug_drug_findings" :key="i">
+                    <article class="finding-card" :class="{ 'finding-card-unreviewed': f.review_status === 'Auto-discovered, unreviewed' }">
+                      <div class="finding-header">
+                        <span x-text="(f.drug_a || '') + (f.drug_b ? ' + ' + f.drug_b : '')"></span>
+                        <span class="badge" :class="'badge-' + (f.severity || '').toLowerCase()" x-text="f.severity"></span>
+                      </div>
+
+                      <template x-if="f.review_status === 'Auto-discovered, unreviewed'">
+                        <div>
+                          <template x-if="f.trusted_source_excerpt">
+                            <div>
+                              <p class="finding-source-label">From FDA label (unreviewed)</p>
+                              <p class="trusted-excerpt" x-text="f.trusted_source_excerpt"></p>
+                            </div>
+                          </template>
+                          <p class="finding-source-label" x-show="f.ai_explanation">AI explanation</p>
+                          <p x-show="f.ai_explanation" x-text="f.ai_explanation"></p>
+                          <template x-if="!f.trusted_source_excerpt && !f.ai_explanation">
+                            <p x-text="f.concern"></p>
+                          </template>
+                          <p class="error">This is an automatically discovered signal, not a clinically reviewed rule. Confirm with your pharmacist or prescribing clinician.</p>
+                        </div>
+                      </template>
+                      <template x-if="f.review_status !== 'Auto-discovered, unreviewed'">
+                        <p x-text="f.interaction || f.concern"></p>
+                      </template>
+                    </article>
+                  </template>
+                </div>
+              </template>
+
+              <template x-if="safety.drug_lab_findings?.length">
+                <div>
+                  <h4>Medication and lab considerations</h4>
+                  <template x-for="(f, i) in safety.drug_lab_findings" :key="i">
+                    <article class="finding-card">
+                      <div class="finding-header">
+                        <span x-text="(f.drug || '') + ' — ' + labLabel(f.lab)"></span>
+                        <span class="badge" :class="'badge-' + (f.severity || '').toLowerCase()" x-text="f.severity"></span>
+                      </div>
+                      <p x-text="f.concern || f.message"></p>
+                      <p class="threshold-basis" x-show="f.threshold_basis" x-text="f.threshold_basis"></p>
+                      <p class="med-meta" x-show="f.observed_value !== undefined">
+                        <span x-text="labLabel(f.lab) + ' ' + f.operator + ' ' + f.threshold + ' (observed: ' + f.observed_value + ')'"></span>
+                      </p>
+                    </article>
+                  </template>
+                </div>
+              </template>
+
+              <details class="finding-evidence" x-show="safety.coverage_note">
+                <summary>What was checked?</summary>
+                <p x-text="safety.coverage_note"></p>
+              </details>
+            </div>
+          </template>
+
+          <div class="error" x-show="safetyStale">This medication's safety check is out of date because lab information changed. Run the safety check again before adding.</div>
+
+          <template x-if="!safetyStale && needsAcknowledgement">
+            <div>
+              <p class="error" x-show="status === 'PROPOSED'">Safety review required before starting this medication.</p>
+              <p class="error" x-show="status === 'CURRENT'">Safety findings were identified. Recording this medication documents what the patient is currently taking and does not indicate that it has been approved or recommended.</p>
+              <label class="field ack-field">
+                <input type="checkbox" x-model="acknowledged">
+                <span x-show="status === 'PROPOSED'">I understand that safety findings were identified and that this proposed medication should be reviewed with the prescribing clinician or pharmacist before it is started.</span>
+                <span x-show="status === 'CURRENT'">Record this as a current medication and flag the returned findings for review.</span>
+              </label>
+            </div>
+          </template>
+
+          <div class="error" x-show="addError" x-text="addError"></div>
+          <button type="button" class="btn" @click="runSafetyCheck()" x-show="safetyStale" :disabled="safetyLoading">Re-run safety check</button>
+          <button type="button" class="btn btn-primary" @click="addMedication()"
+                  :disabled="!canAdd || adding || !endpointAvailable">
+            <span x-show="!adding" x-text="addButtonLabel"></span>
+            <span x-show="adding">Saving…</span>
+          </button>
+          <button type="button" class="btn" x-show="addTimedOutNotAdded" @click="addMedication()" :disabled="adding">Retry</button>
+        </div>
+
+        <div x-show="flowStep === 'done'" x-cloak>
+          <h3>4. Added</h3>
+          <p x-text="addResult?.message"></p>
+          <template x-if="addResult?.duplicate">
+            <p class="empty-note" x-text="'Existing record status: ' + (addResult?.existing_record?.medication_status || '')"></p>
+          </template>
+          <template x-if="addResult?.safety">
+            <div class="safety-panel" :class="'safety-panel-' + (addResult.safety.total_findings ? (addResult.safety.drug_drug_findings.concat(addResult.safety.drug_lab_findings).some(f => (f.severity||'').toLowerCase()==='high') ? 'high' : 'moderate') : 'none')">
+              <p x-text="addResult.safety.message"></p>
+            </div>
+          </template>
+          <button type="button" class="btn btn-primary" @click="startOver()">Search and add another medication</button>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const SEEDS = {{ seed_patients | tojson }};
+
+const LAB_LABELS = { egfr: "eGFR", potassium: "Potassium" };
+function labLabel(code) {
+  return LAB_LABELS[code] || code;
+}
+
+async function fetchJson(url, options) {
+  const resp = await fetch(url, options);
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => ({}));
+    throw new Error(body.detail || `Request failed (${resp.status})`);
+  }
+  return resp.json();
+}
+
+function appShell() {
+  return {
+    selectedSeed: "",
+    patient_id: "",
+    labs: { egfr: null, potassium: null },
+    activeTab: "safety",
+    loadSeed() {
+      if (!this.selectedSeed) {
+        this.patient_id = "";
+        this.labs = { egfr: null, potassium: null };
+        return;
+      }
+      const seed = SEEDS[this.selectedSeed];
+      this.patient_id = seed.patient_id;
+      this.labs = { egfr: seed.labs.egfr, potassium: seed.labs.potassium };
+    },
+  };
+}
+
+function safetyCheckTab() {
+  return {
+    age: null,
+    medicationsText: "",
+    conditionsText: "",
+    allergiesText: "",
+    loading: false,
+    error: null,
+    report: null,
+    init() {
+      this.$watch("selectedSeed", () => this.applySeed());
+      this.$watch("patient_id", () => { this.report = null; this.error = null; });
+    },
+    applySeed() {
+      if (!this.selectedSeed) {
+        this.age = null;
+        this.medicationsText = "";
+        this.conditionsText = "";
+        this.allergiesText = "";
+        return;
+      }
+      const seed = SEEDS[this.selectedSeed];
+      this.age = seed.age;
+      this.medicationsText = seed.medications.join(", ");
+      this.conditionsText = seed.conditions.join(", ");
+      this.allergiesText = seed.allergies.join(", ");
+    },
+    parseList(text) {
+      return text.split(",").map((s) => s.trim()).filter(Boolean);
+    },
+    explanationLabel() {
+      const provider = this.report?.explanation_provider;
+      const model = this.report?.explanation_model;
+      if (!provider && !model) return "";
+      return ["AI explanation", provider, model].filter(Boolean).join(" · ");
+    },
+    cleanExplanation() {
+      const text = this.report?.ai_explanation;
+      if (!text) return "";
+      return text.replace(/\*\*(.+?)\*\*/g, "$1");
+    },
+    async submit() {
+      this.loading = true;
+      this.error = null;
+      this.report = null;
+      try {
+        this.report = await fetchJson("/api/patients/analyze", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            patient_id: this.patient_id,
+            age: this.age,
+            medications: this.parseList(this.medicationsText),
+            conditions: this.parseList(this.conditionsText),
+            allergies: this.parseList(this.allergiesText),
+            labs: { egfr: this.labs.egfr, potassium: this.labs.potassium },
+          }),
+        });
+      } catch (err) {
+        this.error = err.message;
+      } finally {
+        this.loading = false;
+      }
+    },
+  };
+}
+
+function medicationManagementTab() {
+  return {
+    endpointAvailable: true,
+    healthChecking: false,
+
+    medications: [],
+    medicationsLoading: false,
+    medicationsError: null,
+    confirmingRecordId: null,
+    discontinuing: false,
+
+    flowStep: "search",
+    searchQuery: "",
+    searchResults: [],
+    searchLoading: false,
+    searchError: null,
+    searchSeq: 0,
+    _searchTimer: null,
+
+    selectedMatch: null,
+    details: null,
+    detailsLoading: false,
+    detailsError: null,
+
+    status: "PROPOSED",
+    classification: "UNKNOWN",
+
+    safety: null,
+    safetyLoading: false,
+    safetyError: null,
+    safetyStale: false,
+    safetyLabsMissing: false,
+    acknowledged: false,
+
+    adding: false,
+    addError: null,
+    addResult: null,
+    addTimedOutNotAdded: false,
+
+    init() {
+      this.checkHealth();
+      this.$watch("patient_id", (val) => {
+        this.medications = [];
+        this.resetFlow();
+        if (val) this.loadMedications();
+      });
+      this.$watch("labs", () => {
+        if (this.safety) this.safetyStale = true;
+      });
+      if (this.patient_id) this.loadMedications();
+    },
+
+    resetFlow() {
+      this.flowStep = "search";
+      this.searchQuery = "";
+      this.searchResults = [];
+      this.searchError = null;
+      this.selectedMatch = null;
+      this.details = null;
+      this.detailsError = null;
+      this.status = "PROPOSED";
+      this.classification = "UNKNOWN";
+      this.safety = null;
+      this.safetyError = null;
+      this.safetyStale = false;
+      this.acknowledged = false;
+      this.addError = null;
+      this.addResult = null;
+      this.addTimedOutNotAdded = false;
+    },
+
+    async checkHealth() {
+      this.healthChecking = true;
+      try {
+        await fetchJson("/api/medications/health");
+        this.endpointAvailable = true;
+      } catch {
+        this.endpointAvailable = false;
+      } finally {
+        this.healthChecking = false;
+      }
+    },
+
+    async loadMedications() {
+      if (!this.patient_id) return;
+      this.medicationsLoading = true;
+      this.medicationsError = null;
+      try {
+        const data = await fetchJson(`/api/medications/patients/${encodeURIComponent(this.patient_id)}`);
+        this.medications = data.medications || [];
+      } catch (err) {
+        this.medicationsError = err.message;
+      } finally {
+        this.medicationsLoading = false;
+      }
+    },
+
+    onSearchInput() {
+      clearTimeout(this._searchTimer);
+      this._searchTimer = setTimeout(() => this.runSearch(), 400);
+    },
+
+    async runSearch() {
+      const q = this.searchQuery.trim();
+      this.searchError = null;
+      if (q.length < 3) {
+        this.searchResults = [];
+        return;
+      }
+      const seq = ++this.searchSeq;
+      this.searchLoading = true;
+      try {
+        const data = await fetchJson(`/api/medications/search?q=${encodeURIComponent(q)}&limit=10`);
+        if (seq !== this.searchSeq) return;
+        this.searchResults = data.matches || [];
+      } catch (err) {
+        if (seq === this.searchSeq) this.searchError = err.message;
+      } finally {
+        if (seq === this.searchSeq) this.searchLoading = false;
+      }
+    },
+
+    async selectMatch(match) {
+      this.selectedMatch = match;
+      this.details = null;
+      this.detailsError = null;
+      this.safety = null;
+      this.safetyError = null;
+      this.safetyStale = false;
+      this.acknowledged = false;
+      this.addError = null;
+      this.addResult = null;
+      this.status = "PROPOSED";
+      this.classification = "UNKNOWN";
+      this.flowStep = "review";
+      this.detailsLoading = true;
+      try {
+        this.details = await fetchJson(`/api/medications/rxcui/${encodeURIComponent(match.rxcui)}`);
+      } catch (err) {
+        this.detailsError = err.message;
+      } finally {
+        this.detailsLoading = false;
+      }
+    },
+
+    get displayName() {
+      return this.details?.selected_name || this.selectedMatch?.name || "";
+    },
+
+    hasLabs() {
+      return this.labs.egfr != null && this.labs.potassium != null;
+    },
+
+    async runSafetyCheck() {
+      this.safetyLoading = true;
+      this.safetyError = null;
+      this.safety = null;
+      this.safetyStale = false;
+      this.acknowledged = false;
+      this.safetyLabsMissing = !this.hasLabs();
+      try {
+        this.safety = await fetchJson("/api/medications/pre-add-check", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            patient_id: this.patient_id,
+            rxcui: this.selectedMatch.rxcui,
+            labs: this.hasLabs() ? { egfr: this.labs.egfr, potassium: this.labs.potassium } : null,
+          }),
+        });
+        this.flowStep = "safety";
+      } catch (err) {
+        this.safetyError = err.message;
+      } finally {
+        this.safetyLoading = false;
+      }
+    },
+
+    get worstSeverity() {
+      if (!this.safety) return "none";
+      const all = [...(this.safety.drug_drug_findings || []), ...(this.safety.drug_lab_findings || [])];
+      if (all.some((f) => (f.severity || "").toLowerCase() === "high")) return "high";
+      if (all.some((f) => (f.severity || "").toLowerCase() === "moderate")) return "moderate";
+      if (all.some((f) => (f.severity || "").toLowerCase() === "unreviewed")) return "unreviewed";
+      if (all.length) return "low";
+      return "none";
+    },
+
+    get needsAcknowledgement() {
+      return !!(this.safety && this.safety.safety_review_required);
+    },
+
+    get canAdd() {
+      if (!this.patient_id || !this.selectedMatch?.rxcui) return false;
+      if (!this.safety || this.safetyStale) return false;
+      if (this.needsAcknowledgement && !this.acknowledged) return false;
+      return true;
+    },
+
+    get addButtonLabel() {
+      if (this.status === "CURRENT" && this.needsAcknowledgement) return "Record current medication";
+      if (this.status === "CURRENT") return "Add current medication";
+      return "Save as proposed medication";
+    },
+
+    async addMedication() {
+      this.adding = true;
+      this.addError = null;
+      this.addTimedOutNotAdded = false;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 20000);
+      try {
+        const data = await fetchJson("/api/medications/add", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
+          body: JSON.stringify({
+            patient_id: this.patient_id,
+            rxcui: this.selectedMatch.rxcui,
+            medication_status: this.status,
+            medication_type: this.classification,
+            labs: this.hasLabs() ? { egfr: this.labs.egfr, potassium: this.labs.potassium } : null,
+          }),
+        });
+        clearTimeout(timeoutId);
+        this.addResult = data;
+        await this.loadMedications();
+        this.flowStep = "done";
+      } catch (err) {
+        clearTimeout(timeoutId);
+        if (err.name === "AbortError") {
+          await this.loadMedications();
+          const nowPresent = this.medications.some((m) => m.selected_rxcui === this.selectedMatch.rxcui);
+          this.addTimedOutNotAdded = !nowPresent;
+          this.addError = nowPresent
+            ? "The request took too long, but the medication is now present on the active list."
+            : "The request took too long and the medication does not appear to have been added.";
+        } else {
+          this.addError = err.message;
+        }
+      } finally {
+        this.adding = false;
+      }
+    },
+
+    startOver() {
+      this.resetFlow();
+    },
+
+    async discontinue(recordId) {
+      this.discontinuing = true;
+      try {
+        await fetchJson("/api/medications/discontinue", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ patient_id: this.patient_id, medication_record_id: recordId }),
+        });
+        await this.loadMedications();
+      } catch (err) {
+        this.medicationsError = err.message;
+      } finally {
+        this.discontinuing = false;
+        this.confirmingRecordId = null;
+      }
+    },
+  };
+}
+</script>
+{% endblock %}
